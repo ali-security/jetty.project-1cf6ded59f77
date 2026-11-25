@@ -21,9 +21,11 @@ package org.eclipse.jetty.servlets;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.lang.reflect.Field;
 import java.net.Socket;
 import java.nio.charset.StandardCharsets;
 import java.util.EnumSet;
+import java.util.Map;
 
 import javax.servlet.DispatcherType;
 import javax.servlet.Filter;
@@ -48,6 +50,7 @@ public abstract class AbstractDoSFilterTest
     protected String _host;
     protected int _port;
     protected long _requestMaxTime = 200;
+    protected FilterHolder _dosFilter;
 
     public void startServer(Class<? extends Filter> filter) throws Exception
     {
@@ -66,6 +69,9 @@ public abstract class AbstractDoSFilterTest
         dosFilter.setInitParameter("throttleMs", "4000");
         dosFilter.setInitParameter("remotePort", "false");
         dosFilter.setInitParameter("insertHeaders", "true");
+        // session tracking is not supported, even if configured
+        dosFilter.setInitParameter("trackSessions", "true");
+        _dosFilter = dosFilter;
 
         FilterHolder timeoutFilter = _tester.getContext().addFilter(filter, "/timeout/*", EnumSet.of(DispatcherType.REQUEST, DispatcherType.ASYNC));
         timeoutFilter.setInitParameter("maxRequestsPerSec", "4");
@@ -241,56 +247,52 @@ public abstract class AbstractDoSFilterTest
     }
 
     @Test
-    public void testSessionTracking() throws Exception
+    public void testSessionTrackingIsDisabled() throws Exception
     {
-        // get a session, first
-        String requestSession="GET /ctx/dos/test?session=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        String response=doRequests("",1,0,0,requestSession);
-        String sessionId=response.substring(response.indexOf("Set-Cookie: ")+12, response.indexOf(";"));
+        DoSFilter filter = (DoSFilter)_dosFilter.getFilter();
 
-        // all other requests use this session
-        String request="GET /ctx/dos/test HTTP/1.1\r\nHost: localhost\r\nCookie: " + sessionId + "\r\n\r\n";
-        String last="GET /ctx/dos/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: " + sessionId + "\r\n\r\n";
-        String responses = doRequests(request+request+request+request+request,2,1100,1100,last);
+        // the trackSessions=true init parameter is ignored
+        Assert.assertFalse(filter.isTrackSessions());
 
-        Assert.assertEquals(11,count(responses,"HTTP/1.1 200 OK"));
-        Assert.assertEquals(2,count(responses,"DoSFilter: delayed"));
+        // and session tracking cannot be enabled programmatically either
+        filter.setTrackSessions(true);
+        Assert.assertFalse(filter.isTrackSessions());
     }
 
     @Test
-    public void testMultipleSessionTracking() throws Exception
+    public void testSessionsDoNotCreateRateTrackers() throws Exception
     {
-        // get some session ids, first
-        String requestSession="GET /ctx/dos/test?session=true HTTP/1.1\r\nHost: localhost\r\n\r\n";
-        String closeRequest="GET /ctx/dos/test?session=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-        String response=doRequests(requestSession+requestSession,1,0,0,closeRequest);
+        Map<?, ?> rateTrackers = getRateTrackers((DoSFilter)_dosFilter.getFilter());
 
-        String[] sessions = response.split("\r\n\r\n");
+        // CVE-2024-9823: every distinct (non-new) session used to get its own
+        // rate tracker, which was only discarded when the session went away, so
+        // a client minting sessions could grow the rate trackers without bound.
+        int sessions = 5;
+        for (int i = 0; i < sessions; i++)
+        {
+            // obtain a new session
+            String requestSession="GET /ctx/dos/test?session=true HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+            String response=doRequests("",1,0,0,requestSession);
+            int cookie=response.indexOf("Set-Cookie: ");
+            Assert.assertThat(cookie,Matchers.greaterThanOrEqualTo(0));
+            String sessionId=response.substring(cookie+12, response.indexOf(";",cookie));
 
-        String sessionId1=sessions[0].substring(sessions[0].indexOf("Set-Cookie: ")+12, sessions[0].indexOf(";"));
-        String sessionId2=sessions[1].substring(sessions[1].indexOf("Set-Cookie: ")+12, sessions[1].indexOf(";"));
+            // use the session again, so that it is no longer new
+            String request="GET /ctx/dos/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: " + sessionId + "\r\n\r\n";
+            String responses=doRequests("",1,0,0,request);
+            Assert.assertEquals(1,count(responses,"HTTP/1.1 200 OK"));
+        }
 
-        // alternate between sessions
-        String request1="GET /ctx/dos/test HTTP/1.1\r\nHost: localhost\r\nCookie: " + sessionId1 + "\r\n\r\n";
-        String request2="GET /ctx/dos/test HTTP/1.1\r\nHost: localhost\r\nCookie: " + sessionId2 + "\r\n\r\n";
-        String last="GET /ctx/dos/test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nCookie: " + sessionId2 + "\r\n\r\n";
+        // the rate is tracked by IP only, so the number of rate trackers
+        // does not depend on the number of sessions
+        Assert.assertThat("rate trackers " + rateTrackers.keySet(),rateTrackers.size(),Matchers.lessThanOrEqualTo(1));
+    }
 
-        // ensure the sessions are new
-        doRequests(request1+request2,1,1100,1100,last);
-        Thread.sleep(1000);
-
-        String responses = doRequests(request1+request2+request1+request2+request1,2,1100,1100,last);
-
-        Assert.assertEquals(11,count(responses,"HTTP/1.1 200 OK"));
-        Assert.assertEquals(0,count(responses,"DoSFilter: delayed"));
-
-        // alternate between sessions
-        responses = doRequests(request1+request2+request1+request2+request1,2,250,250,last);
-
-        // System.err.println(responses);
-        Assert.assertEquals(11,count(responses,"HTTP/1.1 200 OK"));
-        int delayedRequests = count(responses,"DoSFilter: delayed");
-        Assert.assertTrue("delayedRequests: " + delayedRequests + " is not between 2 and 5",delayedRequests >= 2 && delayedRequests <= 5);
+    private static Map<?, ?> getRateTrackers(DoSFilter filter) throws Exception
+    {
+        Field field = DoSFilter.class.getDeclaredField("_rateTrackers");
+        field.setAccessible(true);
+        return (Map<?, ?>)field.get(filter);
     }
 
     @Test

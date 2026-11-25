@@ -45,7 +45,6 @@ import javax.servlet.ServletRequest;
 import javax.servlet.ServletResponse;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
-import javax.servlet.http.HttpSession;
 import javax.servlet.http.HttpSessionActivationListener;
 import javax.servlet.http.HttpSessionBindingEvent;
 import javax.servlet.http.HttpSessionBindingListener;
@@ -75,9 +74,9 @@ import org.eclipse.jetty.util.thread.Scheduler;
  * throttled.
  * <p>
  * When a request is throttled, it is placed in a priority queue. Priority is
- * given first to authenticated users and users with an HttpSession, then
- * connections which can be identified by their IP addresses. Connections with
- * no way to identify them are given lowest priority.
+ * given first to authenticated users, then connections which can be identified
+ * by their IP addresses. Connections with no way to identify them are given
+ * lowest priority.
  * <p>
  * The {@link #extractUserId(ServletRequest request)} function should be
  * implemented, in order to uniquely identify authenticated users.
@@ -106,10 +105,8 @@ import org.eclipse.jetty.util.thread.Scheduler;
  * before deciding that the user has gone away, and discarding it</dd>
  * <dt>insertHeaders</dt>
  * <dd>if true , insert the DoSFilter headers into the response. Defaults to true.</dd>
- * <dt>trackSessions</dt>
- * <dd>if true, usage rate is tracked by session if a session exists. Defaults to true.</dd>
  * <dt>remotePort</dt>
- * <dd>if true and session tracking is not used, then rate is tracked by IP+port (effectively connection). Defaults to false.</dd>
+ * <dd>if true then rate is tracked by IP+port (effectively connection). Defaults to false.</dd>
  * <dt>ipWhitelist</dt>
  * <dd>a comma-separated list of IP addresses that will not be rate limited</dd>
  * <dt>managedAttr</dt>
@@ -163,7 +160,6 @@ public class DoSFilter implements Filter
     static final String TOO_MANY_CODE = "tooManyCode";
 
     private static final int USER_AUTH = 2;
-    private static final int USER_SESSION = 2;
     private static final int USER_IP = 1;
     private static final int USER_UNKNOWN = 0;
 
@@ -178,7 +174,6 @@ public class DoSFilter implements Filter
     private volatile long _maxRequestMs;
     private volatile long _maxIdleTrackerMs;
     private volatile boolean _insertHeaders;
-    private volatile boolean _trackSessions;
     private volatile boolean _remotePort;
     private volatile boolean _enabled;
     private Semaphore _passes;
@@ -252,7 +247,7 @@ public class DoSFilter implements Filter
         setInsertHeaders(parameter == null || Boolean.parseBoolean(parameter));
 
         parameter = filterConfig.getInitParameter(TRACK_SESSIONS_INIT_PARAM);
-        setTrackSessions(parameter == null || Boolean.parseBoolean(parameter));
+        setTrackSessions(Boolean.parseBoolean(parameter));
 
         parameter = filterConfig.getInitParameter(REMOTE_PORT_INIT_PARAM);
         setRemotePort(parameter != null && Boolean.parseBoolean(parameter));
@@ -545,18 +540,17 @@ public class DoSFilter implements Filter
      * <p>
      * Assumes that each connection has an identifying characteristic, and goes
      * through them in order, taking the first that matches: user id (logged
-     * in), session id, client IP address. Unidentifiable connections are lumped
+     * in), client IP address. Unidentifiable connections are lumped
      * into one.
      * <p>
-     * When a session expires, its rate tracker is automatically deleted.
+     * Rate trackers are discarded once they have been idle for
+     * {@link #getMaxIdleTrackerMs()}.
      *
      * @param request the current request
      * @return the request rate tracker for the current connection
      */
     public RateTracker getRateTracker(ServletRequest request)
     {
-        HttpSession session = ((HttpServletRequest)request).getSession(false);
-
         String loadId = extractUserId(request);
         final int type;
         if (loadId != null)
@@ -565,16 +559,8 @@ public class DoSFilter implements Filter
         }
         else
         {
-            if (isTrackSessions() && session != null && !session.isNew())
-            {
-                loadId = session.getId();
-                type = USER_SESSION;
-            }
-            else
-            {
-                loadId = isRemotePort() ? (request.getRemoteAddr() + request.getRemotePort()) : request.getRemoteAddr();
-                type = USER_IP;
-            }
+            loadId = isRemotePort() ? (request.getRemoteAddr() + request.getRemotePort()) : request.getRemoteAddr();
+            type = USER_IP;
         }
 
         RateTracker tracker = _rateTrackers.get(loadId);
@@ -589,16 +575,8 @@ public class DoSFilter implements Filter
             if (existing != null)
                 tracker = existing;
 
-            if (type == USER_IP)
-            {
-                // USER_IP expiration from _rateTrackers is handled by the _scheduler
-                _scheduler.schedule(tracker, getMaxIdleTrackerMs(), TimeUnit.MILLISECONDS);
-            }
-            else if (session != null)
-            {
-                // USER_SESSION expiration from _rateTrackers are handled by the HttpSessionBindingListener
-                session.setAttribute(__TRACKER, tracker);
-            }
+            // expiration from _rateTrackers is handled by the _scheduler
+            _scheduler.schedule(tracker, getMaxIdleTrackerMs(), TimeUnit.MILLISECONDS);
         }
 
         return tracker;
@@ -954,28 +932,36 @@ public class DoSFilter implements Filter
 
     /**
      * Get flag to have usage rate tracked by session if a session exists.
+     * <p>
+     * Session tracking is no longer supported, as it allowed the rate trackers
+     * to grow without bound, so this flag is always false.
      *
-     * @return value of the flag
+     * @return false
+     * @see <a href="https://github.com/jetty/jetty.project/security/advisories/GHSA-7hcf-ppf8-5w5h">CVE-2024-9823</a>
      */
     @ManagedAttribute("usage rate is tracked by session if one exists")
     public boolean isTrackSessions()
     {
-        return _trackSessions;
+        return false;
     }
 
     /**
      * Set flag to have usage rate tracked by session if a session exists.
+     * <p>
+     * Session tracking is no longer supported, as it allowed the rate trackers
+     * to grow without bound, so this flag is ignored.
      *
-     * @param value value of the flag
+     * @param value ignored
+     * @see <a href="https://github.com/jetty/jetty.project/security/advisories/GHSA-7hcf-ppf8-5w5h">CVE-2024-9823</a>
      */
     public void setTrackSessions(boolean value)
     {
-        _trackSessions = value;
+        if (value)
+            LOG.warn("Session Tracking is not supported");
     }
 
     /**
-     * Get flag to have usage rate tracked by IP+port (effectively connection)
-     * if session tracking is not used.
+     * Get flag to have usage rate tracked by IP+port (effectively connection).
      *
      * @return value of the flag
      */
@@ -986,8 +972,7 @@ public class DoSFilter implements Filter
     }
 
     /**
-     * Set flag to have usage rate tracked by IP+port (effectively connection)
-     * if session tracking is not used.
+     * Set flag to have usage rate tracked by IP+port (effectively connection).
      *
      * @param value value of the flag
      */
